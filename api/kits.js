@@ -9,17 +9,51 @@ export default async function handler(req, res) {
   const token = process.env.NOTION_TOKEN;
   if (!token) return res.status(500).json({ error: 'NOTION_TOKEN not configured' });
 
-  const KITS_DB = '8eb08e72-83d7-4f87-9e0f-c88baf003793';
+  const notionHeaders = {
+    'Authorization': `Bearer ${token}`,
+    'Notion-Version': '2022-06-28',
+    'Content-Type': 'application/json',
+  };
 
   try {
-    // 1. Fetch all kits from the Kits database
+    // Use Notion search to find the Kits database by title
+    // This works even for inline databases that are tricky to access by ID directly
+    const searchRes = await fetch('https://api.notion.com/v1/search', {
+      method: 'POST',
+      headers: notionHeaders,
+      body: JSON.stringify({
+        query: 'Kits',
+        filter: { value: 'database', property: 'object' },
+      }),
+    });
+
+    if (!searchRes.ok) {
+      const err = await searchRes.json();
+      return res.status(502).json({ error: 'Notion search failed', details: err });
+    }
+
+    const searchData = await searchRes.json();
+
+    // Find the Kits database (prefer exact title match)
+    const kitsDb = searchData.results.find(db => {
+      const title = db.title?.[0]?.plain_text ?? '';
+      return title.toLowerCase() === 'kits';
+    }) || searchData.results[0];
+
+    if (!kitsDb) {
+      return res.status(404).json({
+        error: 'Kits database not found via search',
+        hint: 'Make sure the integration is connected to the SnapZilla Kits page in Notion',
+        searchResults: searchData.results.map(r => ({ id: r.id, title: r.title?.[0]?.plain_text }))
+      });
+    }
+
+    const KITS_DB = kitsDb.id;
+
+    // Query the kits database
     const kitsRes = await fetch(`https://api.notion.com/v1/databases/${KITS_DB}/query`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Notion-Version': '2022-06-28',
-        'Content-Type': 'application/json',
-      },
+      headers: notionHeaders,
       body: JSON.stringify({ sorts: [{ property: 'Kit', direction: 'ascending' }] }),
     });
 
@@ -30,7 +64,7 @@ export default async function handler(req, res) {
 
     const kitsData = await kitsRes.json();
 
-    // 2. For each kit, fetch its equipment items in parallel
+    // For each kit, fetch its equipment items in parallel
     const kits = await Promise.all(
       kitsData.results.map(async (kit) => {
         const props = kit.properties;
@@ -38,18 +72,13 @@ export default async function handler(req, res) {
         const notes = props['Notes']?.rich_text?.[0]?.plain_text ?? '';
         const icon = kit.icon?.emoji ?? null;
 
-        // Get related equipment item page IDs
         const itemRelations = props['Equipment items (auto)']?.relation ?? [];
 
-        // Fetch each equipment item page
         const items = await Promise.all(
           itemRelations.map(async (rel) => {
             try {
               const itemRes = await fetch(`https://api.notion.com/v1/pages/${rel.id}`, {
-                headers: {
-                  'Authorization': `Bearer ${token}`,
-                  'Notion-Version': '2022-06-28',
-                },
+                headers: notionHeaders,
               });
               if (!itemRes.ok) return null;
               const item = await itemRes.json();
@@ -79,9 +108,8 @@ export default async function handler(req, res) {
       })
     );
 
-    // Cache for 60 seconds on Vercel edge
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=300');
-    return res.status(200).json({ kits });
+    return res.status(200).json({ kits, dbId: KITS_DB });
 
   } catch (err) {
     return res.status(500).json({ error: 'Unexpected error', details: err.message });
