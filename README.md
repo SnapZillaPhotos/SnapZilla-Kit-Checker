@@ -1,0 +1,1 @@
+# SnapZilla-Kit-Checker
